@@ -41,6 +41,12 @@ gameWon            DWORD 0
 isTimeUp           DWORD 0
 remainingSeconds   DWORD GAME_TIME_LIMIT
 
+; Console Centering Variables
+consoleInfo        CONSOLE_SCREEN_BUFFER_INFO <>
+consoleCols        DWORD 80
+consoleRows        DWORD 25
+contentMarginX     DWORD 0
+
 ; Master Code & Fragment Storage
 ; Master Code is: "33564"
 masterCode         BYTE "33564", 0
@@ -221,14 +227,276 @@ AddFlawlessBonus PROTO C, score:DWORD
 .code
 
 ; =========================================================================
+; CONSOLE CENTERING HELPERS
+; =========================================================================
+
+; -------------------------------------------------------------------------
+; PROCEDURE: UpdateConsoleMetrics
+; Queries console window dimensions via Win32 API and computes
+; consoleCols, consoleRows, and contentMarginX (for an 80-column block).
+; -------------------------------------------------------------------------
+UpdateConsoleMetrics PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+
+    mov consoleCols, 80
+    mov consoleRows, 25
+
+    INVOKE GetStdHandle, STD_OUTPUT_HANDLE
+    cmp eax, -1
+    je UCM_ComputeMargin
+    cmp eax, 0
+    je UCM_ComputeMargin
+
+    mov ebx, eax
+    INVOKE GetConsoleScreenBufferInfo, ebx, ADDR consoleInfo
+    cmp eax, 0
+    je UCM_ComputeMargin
+
+    movsx eax, consoleInfo.srWindow.Right
+    movsx ebx, consoleInfo.srWindow.Left
+    sub eax, ebx
+    inc eax
+    cmp eax, 1
+    jl UCM_CheckRows
+    mov consoleCols, eax
+
+UCM_CheckRows:
+    movsx eax, consoleInfo.srWindow.Bottom
+    movsx ebx, consoleInfo.srWindow.Top
+    sub eax, ebx
+    inc eax
+    cmp eax, 1
+    jl UCM_ComputeMargin
+    mov consoleRows, eax
+
+UCM_ComputeMargin:
+    mov eax, consoleCols
+    cmp eax, 80
+    jbe UCM_ZeroMargin
+    sub eax, 80
+    shr eax, 1
+    mov contentMarginX, eax
+    jmp UCM_Exit
+
+UCM_ZeroMargin:
+    mov contentMarginX, 0
+
+UCM_Exit:
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+UpdateConsoleMetrics ENDP
+
+; -------------------------------------------------------------------------
+; PROCEDURE: SetVerticalStart
+; Refreshes console metrics and moves cursor down to vertically center a
+; screen of height EAX rows (called right after Clrscr).
+; -------------------------------------------------------------------------
+SetVerticalStart PROC
+    push eax
+    push ecx
+    push edx
+
+    call UpdateConsoleMetrics
+
+    mov ecx, consoleRows
+    cmp ecx, eax
+    jbe SVS_Done
+
+    sub ecx, eax
+    shr ecx, 1
+    cmp ecx, 0
+    je SVS_Done
+
+    cmp ecx, 255
+    jbe SVS_Gotoxy
+    mov ecx, 255
+SVS_Gotoxy:
+    mov dl, 0
+    mov dh, cl
+    call Gotoxy
+
+SVS_Done:
+    pop edx
+    pop ecx
+    pop eax
+    ret
+SetVerticalStart ENDP
+
+; -------------------------------------------------------------------------
+; PROCEDURE: PrintSpaces
+; Prints ECX space characters. Preserves all registers.
+; -------------------------------------------------------------------------
+PrintSpaces PROC
+    push eax
+    push ecx
+
+    cmp ecx, 0
+    jle PS_Done
+    mov al, ' '
+PS_Loop:
+    call WriteChar
+    loop PS_Loop
+
+PS_Done:
+    pop ecx
+    pop eax
+    ret
+PrintSpaces ENDP
+
+; -------------------------------------------------------------------------
+; PROCEDURE: WriteStringAtMargin
+; Prints null-terminated string at EDX, indenting every non-empty line by
+; EBX spaces (handles embedded 0dh/0ah newlines cleanly). Preserves regs.
+; -------------------------------------------------------------------------
+WriteStringAtMargin PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    mov esi, edx
+    mov edi, 1                  ; EDI = atLineStart flag (1 = yes, 0 = no)
+
+WSAM_Loop:
+    mov al, [esi]
+    cmp al, 0
+    je WSAM_Done
+
+    cmp al, 0dh
+    je WSAM_HandleCR
+    cmp al, 0ah
+    je WSAM_HandleLF
+
+    cmp edi, 1
+    jne WSAM_PrintChar
+    mov ecx, ebx
+    call PrintSpaces
+    xor edi, edi
+
+WSAM_PrintChar:
+    call WriteChar
+    inc esi
+    jmp WSAM_Loop
+
+WSAM_HandleCR:
+    inc esi
+    mov al, [esi]
+    cmp al, 0ah
+    jne WSAM_DoNewline
+    inc esi
+WSAM_DoNewline:
+    call Crlf
+    mov edi, 1
+    jmp WSAM_Loop
+
+WSAM_HandleLF:
+    inc esi
+    call Crlf
+    mov edi, 1
+    jmp WSAM_Loop
+
+WSAM_Done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+WriteStringAtMargin ENDP
+
+; -------------------------------------------------------------------------
+; PROCEDURE: WriteMarginString
+; Prints null-terminated string at EDX aligned at contentMarginX.
+; -------------------------------------------------------------------------
+WriteMarginString PROC
+    push ebx
+    mov ebx, contentMarginX
+    call WriteStringAtMargin
+    pop ebx
+    ret
+WriteMarginString ENDP
+
+; -------------------------------------------------------------------------
+; PROCEDURE: WriteCenteredBlock
+; Measures the longest line in the null-terminated string at EDX, computes
+; left margin = max(0, (consoleCols - maxLineLen) / 2), and prints it.
+; -------------------------------------------------------------------------
+WriteCenteredBlock PROC
+    push eax
+    push ebx
+    push ecx
+    push esi
+
+    mov esi, edx
+    xor eax, eax                ; EAX = maxLineLen
+    xor ecx, ecx                ; ECX = currentLineLen
+
+WCB_ScanLoop:
+    mov bl, [esi]
+    cmp bl, 0
+    je WCB_EndScan
+    cmp bl, 0dh
+    je WCB_EndLine
+    cmp bl, 0ah
+    je WCB_EndLine
+    inc ecx
+    inc esi
+    jmp WCB_ScanLoop
+
+WCB_EndLine:
+    cmp ecx, eax
+    jbe WCB_ResetLen
+    mov eax, ecx
+WCB_ResetLen:
+    xor ecx, ecx
+    inc esi
+    jmp WCB_ScanLoop
+
+WCB_EndScan:
+    cmp ecx, eax
+    jbe WCB_ComputeMargin
+    mov eax, ecx
+
+WCB_ComputeMargin:
+    mov ebx, consoleCols
+    cmp ebx, eax
+    jbe WCB_ZeroMargin
+    sub ebx, eax
+    shr ebx, 1
+    jmp WCB_Print
+
+WCB_ZeroMargin:
+    xor ebx, ebx
+
+WCB_Print:
+    call WriteStringAtMargin
+
+    pop esi
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+WriteCenteredBlock ENDP
+
+; =========================================================================
 ; PROCEDURE: main
 ; Entry point of program. Initializes console and drives the menu loop.
 ; =========================================================================
+
 main PROC
     ; Set standard Light Green on Black cyber color
     mov eax, COLOR_NORMAL
     call SetTextColor
-    call Randomize
+    
 
 MasterMenuLoop:
     call ShowMenu               ; Display menu and get choice in AL ('1'-'4')
@@ -256,10 +524,12 @@ DisplayHighScore:
 
 QuitProgram:
     call Clrscr
+    mov eax, 3
+    call SetVerticalStart
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET exitMsg
-    call WriteString
+    call WriteCenteredBlock
     mov eax, COLOR_NORMAL
     call SetTextColor
     exit
@@ -273,27 +543,30 @@ main ENDP
 ; =========================================================================
 ShowMenu PROC
     call Clrscr
+    mov eax, 16
+    call SetVerticalStart
+
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET menuBanner1
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     mov eax, COLOR_NORMAL
     call SetTextColor
     call Crlf
     mov edx, OFFSET menuOptions
-    call WriteString
+    call WriteCenteredBlock
 
 GetMenuChar:
     call ReadChar
-    call WriteChar              ; Echo character
+    call WriteChar
     call Crlf
     cmp al, '1'
     jb InvalidMenuChoice
@@ -305,11 +578,11 @@ InvalidMenuChoice:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptWrongAns
-    call WriteString
+    call WriteCenteredBlock
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET menuOptions
-    call WriteString
+    call WriteCenteredBlock
     jmp GetMenuChar
 ShowMenu ENDP
 
@@ -320,23 +593,26 @@ ShowMenu ENDP
 ; =========================================================================
 ShowInstructions PROC
     call Clrscr
+    mov eax, 22
+    call SetVerticalStart
+
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET instrTitle
-    call WriteString
+    call WriteMarginString
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET instrBody
-    call WriteString
+    call WriteMarginString
 
-    call ReadChar               ; Wait for any key
+    call ReadChar
     ret
 ShowInstructions ENDP
 
@@ -347,20 +623,31 @@ ShowInstructions ENDP
 ; =========================================================================
 ShowHighScore PROC
     call Clrscr
+    mov eax, 8
+    call SetVerticalStart
+
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET highScoreTitle
-    call WriteString
+    call WriteMarginString
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     mov eax, COLOR_SUCCESS
     call SetTextColor
     call Crlf
+    mov eax, consoleCols
+    cmp eax, 32
+    jbe SHS_NoCenter
+    sub eax, 32
+    shr eax, 1
+    mov ecx, eax
+    call PrintSpaces
+SHS_NoCenter:
     mov edx, OFFSET highScoreMsg
     call WriteString
     mov eax, highScore
@@ -370,7 +657,7 @@ ShowHighScore PROC
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteCenteredBlock
     call ReadChar
     ret
 ShowHighScore ENDP
@@ -416,14 +703,14 @@ ShowStatus PROC
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Display Level Number
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET statusLevelStr
-    call WriteString
+    call WriteMarginString
     mov eax, currentLevel
     call WriteDec
     mov edx, OFFSET statusOf5Str
@@ -460,7 +747,7 @@ NoShieldsPrint:
 
     ; Display Unlocked Fragments
     mov edx, OFFSET promptFragmentsHUD
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET unlockedFragments
@@ -470,7 +757,7 @@ NoShieldsPrint:
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov eax, COLOR_NORMAL
@@ -494,10 +781,10 @@ CheckTimer PROC
     push edx
 
     call GetMseconds
-    sub eax, gameStartTime      ; EAX = elapsed milliseconds
+    sub eax, gameStartTime
     mov edx, 0
     mov ebx, 1000
-    div ebx                     ; EAX = elapsed seconds
+    div ebx
 
     cmp eax, GAME_TIME_LIMIT
     jae TimeExpired
@@ -543,7 +830,7 @@ ShowLoseLifeMsg:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptWrongAns
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_NORMAL
     call SetTextColor
@@ -597,7 +884,7 @@ UpperLoop:
     jb UpperNext
     cmp al, 'z'
     ja UpperNext
-    sub al, 32                  ; Convert lowercase ASCII to uppercase
+    sub al, 32
     mov [esi], al
 UpperNext:
     inc esi
@@ -629,10 +916,10 @@ CmpLoop:
     inc edi
     jmp CmpLoop
 CmpBothEnd:
-    mov eax, 1                  ; Match!
+    mov eax, 1
     jmp CmpExit
 CmpMismatch:
-    mov eax, 0                  ; Mismatch!
+    mov eax, 0
 CmpExit:
     pop ebx
     pop edi
@@ -657,45 +944,43 @@ L1_PromptLoop:
     je L1_Exit
 
     call Clrscr
+    mov eax, 18
+    call SetVerticalStart
     call ShowStatus
 
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET l1_title
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET l1_desc
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Print binary packets
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
-    mov al, ' '
-    call WriteChar
-    mov al, ' '
-    call WriteChar
     mov edx, OFFSET l1_binaryStr
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     ; Prompt user
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET promptInput
-    call WriteString
+    call WriteMarginString
 
     ; Read user string
     mov edx, OFFSET inputBuffer
@@ -722,12 +1007,12 @@ L1_PromptLoop:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET l1_hintMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L1_PromptLoop
 
@@ -749,7 +1034,7 @@ L1_CheckAnswer:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L1_PromptLoop
 
@@ -757,11 +1042,11 @@ L1_Empty:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptEmptyErr
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L1_PromptLoop
 
@@ -776,7 +1061,7 @@ L1_Success:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptFirstBonus
-    call WriteString
+    call WriteMarginString
     call Crlf
 
 L1_StoreFragment:
@@ -786,10 +1071,10 @@ L1_StoreFragment:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptCorrectAns
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET promptFragment
-    call WriteString
+    call WriteMarginString
     mov al, '1'
     call WriteChar
     mov edx, OFFSET promptFragmentVal
@@ -801,7 +1086,7 @@ L1_StoreFragment:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
 
 L1_Exit:
@@ -825,27 +1110,29 @@ L2_PromptLoop:
     je L2_Exit
 
     call Clrscr
+    mov eax, 18
+    call SetVerticalStart
     call ShowStatus
 
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET l2_title
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov eax, COLOR_NORMAL
     call SetTextColor
     ; Display Arithmetic Clues
     mov edx, OFFSET l2_desc
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Prompt user
     mov edx, OFFSET promptInput
-    call WriteString
+    call WriteMarginString
 
     ; Read user string
     mov edx, OFFSET inputBuffer
@@ -872,12 +1159,12 @@ L2_PromptLoop:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET l2_hintMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L2_PromptLoop
 
@@ -899,7 +1186,7 @@ L2_CheckAnswer:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L2_PromptLoop
 
@@ -907,11 +1194,11 @@ L2_Empty:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptEmptyErr
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L2_PromptLoop
 
@@ -926,7 +1213,7 @@ L2_Success:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptFirstBonus
-    call WriteString
+    call WriteMarginString
     call Crlf
 
 L2_StoreFragment:
@@ -936,10 +1223,10 @@ L2_StoreFragment:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptCorrectAns
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET promptFragment
-    call WriteString
+    call WriteMarginString
     mov al, '2'
     call WriteChar
     mov edx, OFFSET promptFragmentVal
@@ -951,7 +1238,7 @@ L2_StoreFragment:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
 
 L2_Exit:
@@ -975,45 +1262,43 @@ L3_PromptLoop:
     je L3_Exit
 
     call Clrscr
+    mov eax, 18
+    call SetVerticalStart
     call ShowStatus
 
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET l3_title
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET l3_desc
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Print hex payload
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
-    mov al, ' '
-    call WriteChar
-    mov al, ' '
-    call WriteChar
     mov edx, OFFSET l3_hexStr
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     ; Prompt user
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET promptInput
-    call WriteString
+    call WriteMarginString
 
     ; Read user string
     mov edx, OFFSET inputBuffer
@@ -1040,12 +1325,12 @@ L3_PromptLoop:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET l3_hintMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L3_PromptLoop
 
@@ -1067,7 +1352,7 @@ L3_CheckAnswer:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L3_PromptLoop
 
@@ -1075,11 +1360,11 @@ L3_Empty:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptEmptyErr
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L3_PromptLoop
 
@@ -1094,7 +1379,7 @@ L3_Success:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptFirstBonus
-    call WriteString
+    call WriteMarginString
     call Crlf
 
 L3_StoreFragment:
@@ -1104,10 +1389,10 @@ L3_StoreFragment:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptCorrectAns
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET promptFragment
-    call WriteString
+    call WriteMarginString
     mov al, '3'
     call WriteChar
     mov edx, OFFSET promptFragmentVal
@@ -1119,7 +1404,7 @@ L3_StoreFragment:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
 
 L3_Exit:
@@ -1143,26 +1428,28 @@ L4_PromptLoop:
     je L4_Exit
 
     call Clrscr
+    mov eax, 18
+    call SetVerticalStart
     call ShowStatus
 
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET l4_title
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET l4_desc
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Prompt user
     mov edx, OFFSET promptInput
-    call WriteString
+    call WriteMarginString
 
     ; Read user string
     mov edx, OFFSET inputBuffer
@@ -1189,12 +1476,12 @@ L4_PromptLoop:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET l4_hintMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L4_PromptLoop
 
@@ -1216,7 +1503,7 @@ L4_CheckAnswer:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L4_PromptLoop
 
@@ -1224,11 +1511,11 @@ L4_Empty:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptEmptyErr
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L4_PromptLoop
 
@@ -1243,7 +1530,7 @@ L4_Success:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptFirstBonus
-    call WriteString
+    call WriteMarginString
     call Crlf
 
 L4_StoreFragment:
@@ -1253,22 +1540,22 @@ L4_StoreFragment:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptCorrectAns
-    call WriteString
+    call WriteMarginString
     call Crlf
 
-    ; Active bit rotation demonstration (Lab 09)
+    ; Active bit rotation demonstration
     mov al, 6
-    rol al, 1                   ; 6 rotated left becomes 12!
-    ror al, 1                   ; 12 rotated right restores 6!
+    rol al, 1
+    ror al, 1
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET l4_rotationDemo
-    call WriteString
+    call WriteMarginString
 
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptFragment
-    call WriteString
+    call WriteMarginString
     mov al, '4'
     call WriteChar
     mov edx, OFFSET promptFragmentVal
@@ -1280,7 +1567,7 @@ L4_StoreFragment:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
 
 L4_Exit:
@@ -1306,33 +1593,40 @@ L5_PromptLoop:
     je L5_Exit
 
     call Clrscr
+    mov eax, 18
+    call SetVerticalStart
     call ShowStatus
 
     mov eax, COLOR_HEADER
     call SetTextColor
     mov edx, OFFSET l5_title
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET subBorderLine
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET l5_desc
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Display Array Elements using LOOP and indirect addressing [ESI]
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
-    mov al, ' '
-    call WriteChar
-    mov al, ' '
-    call WriteChar
+
+    mov eax, consoleCols
+    cmp eax, 27
+    jbe L5_NoArrayIndent
+    sub eax, 27
+    shr eax, 1
+    mov ecx, eax
+    call PrintSpaces
+L5_NoArrayIndent:
 
     mov esi, OFFSET evidenceArray
     mov ecx, ARRAY_LEN
@@ -1348,14 +1642,14 @@ PrintEvidenceLoop:
 
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     ; Prompt user
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET promptInput
-    call WriteString
+    call WriteMarginString
 
     ; Read user string
     mov edx, OFFSET inputBuffer
@@ -1382,12 +1676,12 @@ PrintEvidenceLoop:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET l5_hintMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L5_PromptLoop
 
@@ -1409,7 +1703,7 @@ L5_CheckAnswer:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L5_PromptLoop
 
@@ -1417,11 +1711,11 @@ L5_Empty:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptEmptyErr
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp L5_PromptLoop
 
@@ -1436,7 +1730,7 @@ L5_Success:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptFirstBonus
-    call WriteString
+    call WriteMarginString
     call Crlf
 
 L5_StoreFragment:
@@ -1446,10 +1740,10 @@ L5_StoreFragment:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET promptCorrectAns
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET promptFragment
-    call WriteString
+    call WriteMarginString
     mov al, '5'
     call WriteChar
     mov edx, OFFSET promptFragmentVal
@@ -1461,7 +1755,7 @@ L5_StoreFragment:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
 
 L5_Exit:
@@ -1493,33 +1787,35 @@ VaultPromptLoop:
     sub ebx, eax                ; EBX = remaining vault seconds
 
     call Clrscr
+    mov eax, 13
+    call SetVerticalStart
 
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET vault_title
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET vault_desc
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     mov edx, OFFSET promptFragmentsHUD
-    call WriteString
+    call WriteMarginString
     mov edx, OFFSET unlockedFragments
     call WriteString
     call Crlf
 
     mov edx, OFFSET statusTimeStr
-    call WriteString
+    call WriteMarginString
     mov eax, ebx
     call WriteDec
     mov edx, OFFSET secondsStr
@@ -1529,7 +1825,7 @@ VaultPromptLoop:
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET promptInput
-    call WriteString
+    call WriteMarginString
 
     ; Read user string
     mov edx, OFFSET inputBuffer
@@ -1564,7 +1860,7 @@ VaultPromptLoop:
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp VaultPromptLoop
 
@@ -1572,11 +1868,11 @@ VaultEmpty:
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET promptEmptyErr
-    call WriteString
+    call WriteMarginString
     mov eax, COLOR_DIM
     call SetTextColor
     mov edx, OFFSET pressKeyMsg
-    call WriteString
+    call WriteMarginString
     call ReadChar
     jmp VaultPromptLoop
 
@@ -1602,6 +1898,8 @@ FinalVault ENDP
 ; =========================================================================
 ShowResult PROC
     call Clrscr
+    mov eax, 13
+    call SetVerticalStart
 
     cmp gameWon, 1
     je VictoryBranch
@@ -1610,41 +1908,41 @@ ShowResult PROC
     mov eax, COLOR_ALERT
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET gameOverTitle
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     cmp isTimeUp, 1
     je TimeExpiredFail
     mov edx, OFFSET livesOutReason
-    call WriteString
+    call WriteMarginString
     jmp PrintFinalScoreSection
 
 TimeExpiredFail:
     mov edx, OFFSET timeOutReason
-    call WriteString
+    call WriteMarginString
     jmp PrintFinalScoreSection
 
 VictoryBranch:
     mov eax, COLOR_SUCCESS
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
     mov edx, OFFSET victoryTitle
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     mov edx, OFFSET victoryMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
 
     ; Check for Flawless Run Bonus (+50 if playerLives == MAX_LIVES)
@@ -1657,7 +1955,7 @@ VictoryBranch:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET flawlessBonusMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
 
 PrintFinalScoreSection:
@@ -1665,7 +1963,7 @@ PrintFinalScoreSection:
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET finalScoreMsg
-    call WriteString
+    call WriteMarginString
     mov eax, playerScore
     call WriteDec
     call Crlf
@@ -1678,14 +1976,14 @@ PrintFinalScoreSection:
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET newHighScoreMsg
-    call WriteString
+    call WriteMarginString
     call Crlf
     mov eax, COLOR_NORMAL
     call SetTextColor
 
 RankCalculation:
     mov edx, OFFSET finalRankMsg
-    call WriteString
+    call WriteMarginString
 
     ; Ranks:
     ; 700 - 775: Elite Cyber Agent
@@ -1733,7 +2031,7 @@ DoneRank:
     mov eax, COLOR_NORMAL
     call SetTextColor
     mov edx, OFFSET borderLine
-    call WriteString
+    call WriteCenteredBlock
     call Crlf
 
     ; Ask player if they want to play again
@@ -1748,7 +2046,7 @@ ShowResult ENDP
 ; =========================================================================
 PlayAgain PROC
     mov edx, OFFSET playAgainPrompt
-    call WriteString
+    call WriteMarginString
 
 ReadPlayChar:
     call ReadChar
@@ -1769,10 +2067,12 @@ ReturnToMenu:
 
 TerminateGame:
     call Clrscr
+    mov eax, 3
+    call SetVerticalStart
     mov eax, COLOR_WARN
     call SetTextColor
     mov edx, OFFSET exitMsg
-    call WriteString
+    call WriteCenteredBlock
     mov eax, COLOR_NORMAL
     call SetTextColor
     exit
